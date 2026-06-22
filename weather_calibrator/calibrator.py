@@ -1,12 +1,28 @@
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import numpy as np
 from scipy.interpolate import griddata
 
 from .data_loader import CleanedDataset
+
+
+@dataclass
+class AnomalyAlert:
+    threshold: float
+    window_size: int
+    total_anomalous_regions: int
+    anomalous_indices: List[Dict] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        return {
+            "threshold": self.threshold,
+            "window_size": self.window_size,
+            "total_anomalous_regions": self.total_anomalous_regions,
+            "anomalous_indices": self.anomalous_indices,
+        }
 
 
 @dataclass
@@ -22,6 +38,7 @@ class CalibrationResult:
     target_longitudes: np.ndarray = field(default_factory=lambda: np.array([]))
     bicubic_temperature: np.ndarray = field(default_factory=lambda: np.array([]))
     bicubic_pressure: np.ndarray = field(default_factory=lambda: np.array([]))
+    anomaly_alert: Optional[AnomalyAlert] = None
 
     def to_dict(self) -> Dict:
         def _tolist(arr):
@@ -29,7 +46,7 @@ class CalibrationResult:
                 return arr.tolist()
             return arr
 
-        return {
+        result = {
             "timestamps": _tolist(self.timestamps),
             "latitudes": _tolist(self.latitudes),
             "longitudes": _tolist(self.longitudes),
@@ -42,6 +59,9 @@ class CalibrationResult:
             "bicubic_temperature": _tolist(self.bicubic_temperature),
             "bicubic_pressure": _tolist(self.bicubic_pressure),
         }
+        if self.anomaly_alert is not None:
+            result["anomaly_alert"] = self.anomaly_alert.to_dict()
+        return result
 
 
 class Calibrator:
@@ -49,14 +69,26 @@ class Calibrator:
     TEMPERATURE_LAPSE_RATE = 0.0065
     GAS_CONSTANT_DRY_AIR = 287.058
     GRAVITY = 9.80665
+    DEFAULT_PRESSURE_STD_THRESHOLD = 5.0
+    DEFAULT_ANOMALY_WINDOW = 3
 
     def __init__(
         self,
         dataset: Optional[CleanedDataset] = None,
         elevation_m: Optional[np.ndarray] = None,
+        pressure_std_threshold: Optional[float] = None,
+        anomaly_window_size: Optional[int] = None,
     ) -> None:
         self.dataset = dataset
         self.elevation_m = elevation_m
+        self.pressure_std_threshold = (
+            pressure_std_threshold if pressure_std_threshold is not None
+            else self.DEFAULT_PRESSURE_STD_THRESHOLD
+        )
+        self.anomaly_window_size = (
+            anomaly_window_size if anomaly_window_size is not None
+            else self.DEFAULT_ANOMALY_WINDOW
+        )
         self._result: Optional[CalibrationResult] = None
 
     def _fill_missing(self, grid: np.ndarray) -> np.ndarray:
@@ -206,6 +238,47 @@ class Calibrator:
 
         return result
 
+    def _detect_anomalous_regions(
+        self,
+        bicubic_pressure: np.ndarray,
+        tgt_lat: np.ndarray,
+        tgt_lon: np.ndarray,
+        threshold: Optional[float] = None,
+        window_size: Optional[int] = None,
+    ) -> AnomalyAlert:
+        n_times, n_lat, n_lon = bicubic_pressure.shape
+        std_threshold = threshold if threshold is not None else self.pressure_std_threshold
+        win = window_size if window_size is not None else self.anomaly_window_size
+        half_win = win // 2
+
+        std_map = np.std(bicubic_pressure, axis=0, ddof=1)
+
+        anomalous: List[Dict] = []
+        for i in range(half_win, n_lat - half_win, win):
+            for j in range(half_win, n_lon - half_win, win):
+                region = std_map[
+                    i - half_win : i + half_win + 1,
+                    j - half_win : j + half_win + 1,
+                ]
+                region_std = np.mean(region)
+                if region_std > std_threshold:
+                    anomalous.append({
+                        "center_lat_idx": i,
+                        "center_lon_idx": j,
+                        "center_latitude": float(tgt_lat[i]),
+                        "center_longitude": float(tgt_lon[j]),
+                        "window_lat_range": [i - half_win, i + half_win],
+                        "window_lon_range": [j - half_win, j + half_win],
+                        "region_mean_std": float(region_std),
+                    })
+
+        return AnomalyAlert(
+            threshold=float(std_threshold),
+            window_size=int(win),
+            total_anomalous_regions=len(anomalous),
+            anomalous_indices=anomalous,
+        )
+
     def calibrate(
         self,
         dataset: Optional[CleanedDataset] = None,
@@ -269,6 +342,10 @@ class Calibrator:
             calibrated_pressure, latitudes, longitudes, tgt_lat, tgt_lon
         )
 
+        anomaly_alert = self._detect_anomalous_regions(
+            bicubic_press, tgt_lat, tgt_lon
+        )
+
         self._result = CalibrationResult(
             timestamps=data.timestamps,
             latitudes=latitudes,
@@ -281,6 +358,7 @@ class Calibrator:
             target_longitudes=tgt_lon,
             bicubic_temperature=bicubic_temp,
             bicubic_pressure=bicubic_press,
+            anomaly_alert=anomaly_alert,
         )
 
         return self._result
@@ -289,6 +367,13 @@ class Calibrator:
         res = result or self._result
         if res is None:
             raise RuntimeError("No calibration result available. Call calibrate() first.")
+
+        if res.anomaly_alert is None and res.bicubic_pressure.size > 0:
+            res.anomaly_alert = self._detect_anomalous_regions(
+                res.bicubic_pressure,
+                res.target_latitudes,
+                res.target_longitudes,
+            )
 
         directory = os.path.dirname(output_path)
         if directory and not os.path.isdir(directory):
