@@ -228,8 +228,16 @@ class Calibrator:
             press_grid, temp_grid, data.latitudes
         )
 
-        lat_min, lat_max = data.latitudes.min(), data.latitudes.max()
-        lon_min, lon_max = data.longitudes.min(), data.longitudes.max()
+        sort_idx = np.lexsort((data.longitudes, data.latitudes))
+        latitudes = data.latitudes[sort_idx]
+        longitudes = data.longitudes[sort_idx]
+        temp_grid = temp_grid[:, sort_idx]
+        press_grid = press_grid[:, sort_idx]
+        calibrated_pressure = calibrated_pressure[:, sort_idx]
+        filled_mask = filled_mask[:, sort_idx]
+
+        lat_min, lat_max = latitudes.min(), latitudes.max()
+        lon_min, lon_max = longitudes.min(), longitudes.max()
 
         if lat_min == lat_max:
             lat_min -= 0.5
@@ -243,7 +251,7 @@ class Calibrator:
         elif num_lat_points is not None:
             tgt_lat = np.linspace(lat_min, lat_max, num_lat_points)
         else:
-            n = max(len(data.latitudes) * 2, 10)
+            n = max(len(latitudes) * 2, 10)
             tgt_lat = np.linspace(lat_min, lat_max, n)
 
         if target_lon_step is not None:
@@ -251,20 +259,20 @@ class Calibrator:
         elif num_lon_points is not None:
             tgt_lon = np.linspace(lon_min, lon_max, num_lon_points)
         else:
-            n = max(len(data.longitudes) * 2, 10)
+            n = max(len(longitudes) * 2, 10)
             tgt_lon = np.linspace(lon_min, lon_max, n)
 
         bicubic_temp = self._interpolate_scatter_to_grid(
-            temp_grid, data.latitudes, data.longitudes, tgt_lat, tgt_lon
+            temp_grid, latitudes, longitudes, tgt_lat, tgt_lon
         )
         bicubic_press = self._interpolate_scatter_to_grid(
-            calibrated_pressure, data.latitudes, data.longitudes, tgt_lat, tgt_lon
+            calibrated_pressure, latitudes, longitudes, tgt_lat, tgt_lon
         )
 
         self._result = CalibrationResult(
             timestamps=data.timestamps,
-            latitudes=data.latitudes,
-            longitudes=data.longitudes,
+            latitudes=latitudes,
+            longitudes=longitudes,
             temperature_grid=temp_grid,
             pressure_grid=press_grid,
             calibrated_pressure_grid=calibrated_pressure,
